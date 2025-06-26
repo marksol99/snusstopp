@@ -2,14 +2,13 @@ import discord
 from discord.ext import commands, tasks
 import asyncio
 import datetime
-import json
 import os
-import csv
+import uuid
+from supabase import create_client, Client
 
 TOKEN = os.getenv("TOKEN")
-DATA_FILE = "snusstopp_data.json"
-LOG_FILE = "snusstopp_log.csv"
-MAX_LOG_DAYS = 4
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -21,80 +20,92 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 snusstopp_message_id = None
 registered_users = set()
-streaks = {}  # {user_id: {"streak": int, "almost_count": int}}
 today_checkins = {}  # {user_id: emoji}
 latest_checkin_message_id = None
 latest_checkin_date = None
 
-# ------------------ LAGRING ------------------
-def save_data():
-    with open(DATA_FILE, 'w') as f:
-        json.dump({
-            "registered_users": list(registered_users),
-            "streaks": streaks
-        }, f)
+# Opprett supabase klient
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def load_data():
-    global registered_users, streaks
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
-                registered_users = set(data.get("registered_users", []))
-                streaks.clear()
-                for uid, val in data.get("streaks", {}).items():
-                    # sikkerhetssjekk: val kan være int eller dict
-                    if isinstance(val, dict):
-                        streaks[uid] = {
-                            "streak": val.get("streak", 0),
-                            "almost_count": val.get("almost_count", 0)
-                        }
-                    else:
-                        # fallback hvis eldre data
-                        streaks[uid] = {"streak": val, "almost_count": 0}
-        except Exception as e:
-            print(f"Feil ved lasting av data: {e}")
-            registered_users = set()
-            streaks.clear()
+# --- ASYNKRONE SUPABASE FUNKSJONER ---
 
-# ------------------ LOGGING ------------------
-def log_event(event_type, user_id, extra=""):
-    """Logger event til CSV med timestamp, event, user_id og ekstra info."""
+async def log_event(event_type, user_id, extra=""):
     now = datetime.datetime.utcnow().isoformat()
-    row = [now, event_type, user_id, extra]
-    # Sjekk om fil finnes, hvis ikke lag med header
-    file_exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["timestamp", "event", "user_id", "extra"])
-        writer.writerow(row)
-    prune_logs()
+    data = {
+        "event": event_type,
+        "user_id": user_id,
+        "timestamp": now,
+        "extra": extra
+    }
+    def insert_log():
+        return supabase.table("logs").insert(data).execute()
+    result = await asyncio.to_thread(insert_log)
+    if result.error:
+        print(f"Supabase log error: {result.error.message}")
 
-def prune_logs():
-    """Fjern logg-linjer eldre enn MAX_LOG_DAYS dager."""
-    if not os.path.exists(LOG_FILE):
+async def register_user(user_id: int):
+    if user_id in registered_users:
         return
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=MAX_LOG_DAYS)
-    with open(LOG_FILE, 'r', encoding='utf-8') as f:
-        lines = list(csv.reader(f))
-    header = lines[0]
-    filtered = [header]
-    for row in lines[1:]:
-        try:
-            ts = datetime.datetime.fromisoformat(row[0])
-            if ts >= cutoff:
-                filtered.append(row)
-        except Exception:
-            # ved feil i tidsformat, behold linjen for sikkerhet
-            filtered.append(row)
-    with open(LOG_FILE, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerows(filtered)
+    registered_users.add(user_id)
+    await log_event("register", user_id)
 
-# ------------------ HJELPEFUNKSJONER ------------------
+async def unregister_user(user_id: int):
+    if user_id in registered_users:
+        registered_users.remove(user_id)
+        await log_event("unregister", user_id)
+
+async def get_streak(user_id: int):
+    def fetch_streak():
+        return supabase.table("streaks").select("*").eq("user_id", user_id).execute()
+    result = await asyncio.to_thread(fetch_streak)
+    if result.error:
+        print(f"Feil ved henting streak: {result.error.message}")
+        return {"streak": 0, "almost_count": 0}
+    if result.data and len(result.data) > 0:
+        return result.data[0]
+    return {"streak": 0, "almost_count": 0}
+
+async def save_streak(user_id: int, streak: int, almost_count: int):
+    existing = await get_streak(user_id)
+    def upsert():
+        if existing and "user_id" in existing and existing["user_id"] == user_id:
+            return supabase.table("streaks").update({
+                "streak": streak,
+                "almost_count": almost_count
+            }).eq("user_id", user_id).execute()
+        else:
+            return supabase.table("streaks").insert({
+                "user_id": user_id,
+                "streak": streak,
+                "almost_count": almost_count
+            }).execute()
+    result = await asyncio.to_thread(upsert)
+    if result.error:
+        print(f"Feil ved lagring av streak: {result.error.message}")
+
+async def save_checkin(user_id: int, status: str):
+    today = datetime.datetime.utcnow().date().isoformat()
+    def upsert_checkin():
+        existing = supabase.table("checkins").select("*")\
+            .eq("user_id", user_id)\
+            .eq("date", today).execute()
+        if existing.data and len(existing.data) > 0:
+            checkin_id = existing.data[0]["id"]
+            return supabase.table("checkins").update({"status": status}).eq("id", checkin_id).execute()
+        else:
+            return supabase.table("checkins").insert({
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "date": today,
+                "status": status
+            }).execute()
+    result = await asyncio.to_thread(upsert_checkin)
+    if result.error:
+        print(f"Feil ved lagring av checkin: {result.error.message}")
+
+# --- HJELPEFUNKSJONER ---
+
 def can_checkin_today():
-    """Returnerer True hvis det er samme dag som latest_checkin_date."""
     if latest_checkin_date is None:
         return False
     now = datetime.datetime.utcnow().date()
@@ -119,15 +130,16 @@ async def update_snusstopp_message(message):
     except discord.errors.Forbidden:
         print("Manglende tillatelse til å oppdatere meldingen.")
 
-# ------------------ EVENT ------------------
+# --- BOT EVENTS ---
+
 @bot.event
 async def on_ready():
     print(f'Logget inn som {bot.user}')
-    load_data()
     daily_checkin.start()
     evening_reminder.start()
 
-# ------------------ KOMMANDOER ------------------
+# --- BOT COMMANDS ---
+
 @bot.command()
 async def snusstopp(ctx):
     global snusstopp_message_id
@@ -138,8 +150,7 @@ async def snusstopp(ctx):
 
 @bot.command()
 async def streak(ctx):
-    user_id = str(ctx.author.id)
-    data = streaks.get(user_id, {"streak": 0, "almost_count": 0})
+    data = await get_streak(ctx.author.id)
     streak_count = data.get("streak", 0)
     nesten_count = data.get("almost_count", 0)
     await ctx.send(f"{ctx.author.display_name}, din streak er {streak_count} dager snusfri 🔥 og {nesten_count} 'nesten' dager 🟡.")
@@ -150,7 +161,8 @@ async def triggercheckin(ctx):
     """Administrator-kommando for å trigge dagens innsjekk manuelt."""
     await send_daily_checkin()
 
-# ------------------ REAKSJONSHÅNDTERING ------------------
+# --- REACTION HANDLERS ---
+
 @bot.event
 async def on_reaction_add(reaction, user):
     global latest_checkin_message_id
@@ -158,20 +170,15 @@ async def on_reaction_add(reaction, user):
         return
 
     if reaction.message.id == snusstopp_message_id and str(reaction.emoji) == "❌":
-        # Påmelding
-        if user.id not in registered_users:
-            registered_users.add(user.id)
-            save_data()
-            await update_snusstopp_message(reaction.message)
-            log_event("register", user.id)
+        await register_user(user.id)
+        await update_snusstopp_message(reaction.message)
         return
 
     if reaction.message.id == latest_checkin_message_id:
         if user.id not in registered_users:
-            return  # Ikke registrert, ignorer
+            return
 
         if not can_checkin_today():
-            # Svar med pm? Ignorer
             return
 
         emoji = str(reaction.emoji)
@@ -179,26 +186,21 @@ async def on_reaction_add(reaction, user):
             return
 
         if user.id in today_checkins:
-            # Bruker har allerede sjekket inn i dag - ignorér for å unngå spam
-            return
+            return  # har allerede sjekket inn
 
         today_checkins[user.id] = emoji
 
-        user_id_str = str(user.id)
-
-        # Oppdater streaks og almost_counts
-        current = streaks.get(user_id_str, {"streak": 0, "almost_count": 0})
+        current = await get_streak(user.id)
         if emoji == "✅":
             current["streak"] = current.get("streak", 0) + 1
         elif emoji == "🟡":
             current["almost_count"] = current.get("almost_count", 0) + 1
         elif emoji == "🔴":
             current["streak"] = 0
-            # almost_count uendret
 
-        streaks[user_id_str] = current
-        save_data()
-        log_event("checkin", user.id, emoji)
+        await save_streak(user.id, current["streak"], current["almost_count"])
+        await save_checkin(user.id, emoji)
+        await log_event("checkin", user.id, emoji)
         return
 
 @bot.event
@@ -207,11 +209,8 @@ async def on_reaction_remove(reaction, user):
         return
 
     if reaction.message.id == snusstopp_message_id and str(reaction.emoji) == "❌":
-        if user.id in registered_users:
-            registered_users.remove(user.id)
-            save_data()
-            await update_snusstopp_message(reaction.message)
-            log_event("unregister", user.id)
+        await unregister_user(user.id)
+        await update_snusstopp_message(reaction.message)
         return
 
     if reaction.message.id == latest_checkin_message_id:
@@ -226,29 +225,27 @@ async def on_reaction_remove(reaction, user):
             return
 
         if user.id not in today_checkins:
-            return  # Har ikke sjekket inn - ignorér
+            return
 
-        # Fjern innsjekk
         del today_checkins[user.id]
 
-        user_id_str = str(user.id)
-        current = streaks.get(user_id_str, {"streak": 0, "almost_count": 0})
+        current = await get_streak(user.id)
 
-        # Reverser effekten av fjernet reaksjon
+        # reverser effekten av fjernet reaksjon
         if emoji == "✅" and current.get("streak", 0) > 0:
             current["streak"] = max(0, current["streak"] - 1)
         elif emoji == "🟡" and current.get("almost_count", 0) > 0:
             current["almost_count"] = max(0, current["almost_count"] - 1)
         elif emoji == "🔴":
-            # Hvis rød fjernes, gir vi ikke tilbake streak, men la den stå
+            # ikke reverser streak på rød reaksjon fjernet
             pass
 
-        streaks[user_id_str] = current
-        save_data()
-        log_event("checkin_removed", user.id, emoji)
+        await save_streak(user.id, current["streak"], current["almost_count"])
+        await log_event("checkin_removed", user.id, emoji)
         return
 
-# ------------------ DAGLIG MELDING KL. 16 ------------------
+# --- DAGLIG MELDING KL. 16 ---
+
 @tasks.loop(minutes=1)
 async def daily_checkin():
     now = datetime.datetime.utcnow()
@@ -266,9 +263,10 @@ async def send_daily_checkin():
             await msg.add_reaction(emoji)
         latest_checkin_message_id = msg.id
         latest_checkin_date = datetime.datetime.utcnow().date()
-        log_event("daily_checkin_sent", "bot")
+        await log_event("daily_checkin_sent", "bot")
 
-# ------------------ PÅMINNELSE KL. 21 ------------------
+# --- PÅMINNELSE KL. 21 ---
+
 @tasks.loop(minutes=1)
 async def evening_reminder():
     now = datetime.datetime.utcnow()
@@ -279,12 +277,11 @@ async def evening_reminder():
             if not_checked_in:
                 mentions = " ".join(f"<@{uid}>" for uid in not_checked_in)
                 await channel.send(f"Påminnelse til dere som ikke har sjekket inn i dag: {mentions}")
-                log_event("reminder_sent", "bot", ",".join(str(uid) for uid in not_checked_in))
+                await log_event("reminder_sent", "bot", ",".join(str(uid) for uid in not_checked_in))
 
-# ------------------ BEFORE LOOPS ------------------
 @daily_checkin.before_loop
 @evening_reminder.before_loop
-async def before_loops():
+async def before_tasks():
     await bot.wait_until_ready()
 
 bot.run(TOKEN)
