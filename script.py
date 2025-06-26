@@ -33,39 +33,35 @@ async def fetch_registered_users():
         res = supabase.table("registered_users").select("user_id").execute()
         return res
     res = await asyncio.to_thread(_fetch)
-    if res.error:
-        print(f"Feil ved henting av registrerte brukere: {res.error.message}")
+    if res.status_code != 200 or not res.data:
         return set()
-    return set([row["user_id"] for row in res.data])
+    return set(row["user_id"] for row in res.data)
 
 async def register_user(user_id: int):
     def _insert():
         return supabase.table("registered_users").insert({"user_id": user_id}).execute()
-    # sjekk først om allerede registrert
     users = await fetch_registered_users()
     if user_id in users:
         return
     res = await asyncio.to_thread(_insert)
-    if res.error:
-        print(f"Feil ved registrering av bruker: {res.error.message}")
+    if res.status_code != 201:
+        print(f"Feil ved registrering av bruker: {res}")
 
 async def unregister_user(user_id: int):
     def _delete():
         return supabase.table("registered_users").delete().eq("user_id", user_id).execute()
     res = await asyncio.to_thread(_delete)
-    if res.error:
-        print(f"Feil ved avregistrering av bruker: {res.error.message}")
+    if res.status_code != 200:
+        print(f"Feil ved avregistrering av bruker: {res}")
 
 async def get_streak(user_id: int):
     def _fetch():
-        return supabase.table("streaks").select("*").eq("user_id", user_id).single().execute()
+        return supabase.table("streaks").select("*").eq("user_id", user_id).execute()
     res = await asyncio.to_thread(_fetch)
-    if res.error:
-        print(f"Feil ved henting av streak: {res.error.message}")
+    if res.status_code != 200 or not res.data:
         return {"streak": 0, "almost_count": 0}
-    if res.data:
-        return res.data
-    return {"streak": 0, "almost_count": 0}
+    # Ta første rad hvis flere
+    return res.data[0]
 
 async def save_streak(user_id: int, streak: int, almost_count: int):
     existing = await get_streak(user_id)
@@ -82,8 +78,8 @@ async def save_streak(user_id: int, streak: int, almost_count: int):
                 "almost_count": almost_count
             }).execute()
     res = await asyncio.to_thread(_upsert)
-    if res.error:
-        print(f"Feil ved lagring av streak: {res.error.message}")
+    if res.status_code not in (200, 201):
+        print(f"Feil ved lagring av streak: {res}")
 
 async def save_checkin(user_id: int, status: str):
     today = datetime.datetime.utcnow().date().isoformat()
@@ -91,7 +87,7 @@ async def save_checkin(user_id: int, status: str):
         existing = supabase.table("checkins").select("*")\
             .eq("user_id", user_id)\
             .eq("date", today).execute()
-        if existing.data and len(existing.data) > 0:
+        if existing.status_code == 200 and existing.data and len(existing.data) > 0:
             checkin_id = existing.data[0]["id"]
             return supabase.table("checkins").update({"status": status}).eq("id", checkin_id).execute()
         else:
@@ -102,8 +98,8 @@ async def save_checkin(user_id: int, status: str):
                 "status": status
             }).execute()
     res = await asyncio.to_thread(_upsert_checkin)
-    if res.error:
-        print(f"Feil ved lagring av checkin: {res.error.message}")
+    if res.status_code not in (200, 201):
+        print(f"Feil ved lagring av checkin: {res}")
 
 async def log_event(event_type, user_id, extra=""):
     now = datetime.datetime.utcnow().isoformat()
@@ -116,8 +112,8 @@ async def log_event(event_type, user_id, extra=""):
     def _insert():
         return supabase.table("logs").insert(data).execute()
     res = await asyncio.to_thread(_insert)
-    if res.error:
-        print(f"Supabase log error: {res.error.message}")
+    if res.status_code not in (200, 201):
+        print(f"Supabase log error: {res}")
 
 # --- HJELPEFUNKSJONER ---
 
@@ -138,14 +134,11 @@ def get_user_display_name(user_id):
     return f"User({user_id})"
 
 async def update_snusstopp_message(message):
-    # Hent registrerte brukere fra Supabase for oppdatert liste
     registered_users = await fetch_registered_users()
     if not registered_users:
         user_list = "Ingen deltakere ennå."
     else:
-        names = []
-        for uid in sorted(registered_users):
-            names.append(f"- {get_user_display_name(uid)}")
+        names = [f"- {get_user_display_name(uid)}" for uid in sorted(registered_users)]
         user_list = "\n".join(names)
     new_content = f"Trykk ❌ for å bli med i snusstopputfordringen! Fjern ❌ for å melde deg av.\n\n**Deltakere:**\n{user_list}"
     try:
@@ -158,8 +151,6 @@ async def update_snusstopp_message(message):
 @bot.event
 async def on_ready():
     print(f'Logget inn som {bot.user}')
-    global snusstopp_message_id
-    # Hvis du vil kan du her hente og cache snusstopp_message_id fra supabase eller minne
     daily_checkin.start()
     evening_reminder.start()
 
@@ -172,9 +163,7 @@ async def snusstopp(ctx):
     if not registered_users:
         user_list = "Ingen deltakere ennå."
     else:
-        names = []
-        for uid in sorted(registered_users):
-            names.append(f"- {get_user_display_name(uid)}")
+        names = [f"- {get_user_display_name(uid)}" for uid in sorted(registered_users)]
         user_list = "\n".join(names)
     msg = await ctx.send(f"Trykk ❌ for å bli med i snusstopputfordringen! Fjern ❌ for å melde deg av.\n\n**Deltakere:**\n{user_list}")
     await msg.add_reaction("❌")
@@ -302,14 +291,12 @@ async def evening_reminder():
         if channel:
             registered_users = await fetch_registered_users()
             not_checked_in = [uid for uid in registered_users if uid not in today_checkins]
-            if not_checked_in:
-                mentions = " ".join(f"<@{uid}>" for uid in not_checked_in)
-                await channel.send(f"Påminnelse til dere som ikke har sjekket inn i dag: {mentions}")
-                await log_event("reminder_sent", "bot", ",".join(str(uid) for uid in not_checked_in))
-
-@daily_checkin.before_loop
-@evening_reminder.before_loop
-async def before_tasks():
-    await bot.wait_until_ready()
+            mentions = []
+            for uid in not_checked_in:
+                user = bot.get_user(int(uid))
+                if user:
+                    mentions.append(user.mention)
+            if mentions:
+                await channel.send(f"Hei {', '.join(mentions)}, husk å sjekke inn snusstatus din i dag! Reager på meldingen kl. 16.")
 
 bot.run(TOKEN)
