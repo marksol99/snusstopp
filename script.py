@@ -27,54 +27,50 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- SUPABASE HJELPEFUNKSJONER ---
 
+# --- SUPABASE HJELPEFUNKSJONER ---
+
 async def fetch_registered_users():
-    """Hent registrerte brukere fra Supabase."""
     def _fetch():
-        res = supabase.table("registered_users").select("user_id").execute()
-        return res
+        return supabase.table("registered_users").select("user_id").execute()
     res = await asyncio.to_thread(_fetch)
-    if res.error:
-        print(f"Feil ved henting av registrerte brukere: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Feil ved henting av registrerte brukere: {res.data}")
         return set()
-    # Her user_id er string allerede, vi beholder som string-sett
-    return set([row["user_id"] for row in res.data])
+    return set(row["user_id"] for row in res.data or [])
 
 async def register_user(user_id: int):
-    user_id = str(user_id)  # Konverter til string
-    def _insert():
-        return supabase.table("registered_users").insert({"user_id": user_id}).execute()
-    # sjekk først om allerede registrert
+    user_id = str(user_id)
     users = await fetch_registered_users()
     if user_id in users:
         return
+    def _insert():
+        return supabase.table("registered_users").insert({"user_id": user_id}).execute()
     res = await asyncio.to_thread(_insert)
-    if res.error:
-        print(f"Feil ved registrering av bruker: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Feil ved registrering av bruker: {res.data}")
 
 async def unregister_user(user_id: int):
-    user_id = str(user_id)  # Konverter til string
+    user_id = str(user_id)
     def _delete():
         return supabase.table("registered_users").delete().eq("user_id", user_id).execute()
     res = await asyncio.to_thread(_delete)
-    if res.error:
-        print(f"Feil ved avregistrering av bruker: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Feil ved avregistrering av bruker: {res.data}")
 
 async def get_streak(user_id: int):
-    user_id = str(user_id)  # Konverter til string
+    user_id = str(user_id)
     def _fetch():
-        # Fjernet .single() for trygghet siden kanskje ikke finnes
-        res = supabase.table("streaks").select("*").eq("user_id", user_id).execute()
-        return res
+        return supabase.table("streaks").select("*").eq("user_id", user_id).execute()
     res = await asyncio.to_thread(_fetch)
-    if res.error:
-        print(f"Feil ved henting av streak: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Feil ved henting av streak: {res.data}")
         return {"streak": 0, "almost_count": 0}
     if res.data and len(res.data) > 0:
         return res.data[0]
     return {"streak": 0, "almost_count": 0}
 
 async def save_streak(user_id: int, streak: int, almost_count: int):
-    user_id = str(user_id)  # Konverter til string
+    user_id = str(user_id)
     existing = await get_streak(user_id)
     def _upsert():
         if existing and "user_id" in existing:
@@ -89,16 +85,20 @@ async def save_streak(user_id: int, streak: int, almost_count: int):
                 "almost_count": almost_count
             }).execute()
     res = await asyncio.to_thread(_upsert)
-    if res.error:
-        print(f"Feil ved lagring av streak: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Feil ved lagring av streak: {res.data}")
 
 async def save_checkin(user_id: int, status: str):
-    user_id = str(user_id)  # Konverter til string
+    user_id = str(user_id)
     today = datetime.datetime.utcnow().date().isoformat()
     def _upsert_checkin():
         existing = supabase.table("checkins").select("*")\
             .eq("user_id", user_id)\
             .eq("date", today).execute()
+        if existing.status_code >= 400:
+            # Vi kan eventuelt håndtere feil her også
+            return existing
+
         if existing.data and len(existing.data) > 0:
             checkin_id = existing.data[0]["id"]
             return supabase.table("checkins").update({"status": status}).eq("id", checkin_id).execute()
@@ -110,11 +110,11 @@ async def save_checkin(user_id: int, status: str):
                 "status": status
             }).execute()
     res = await asyncio.to_thread(_upsert_checkin)
-    if res.error:
-        print(f"Feil ved lagring av checkin: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Feil ved lagring av checkin: {res.data}")
 
 async def log_event(event_type, user_id, extra=""):
-    user_id = str(user_id)  # Konverter til string
+    user_id = str(user_id)
     now = datetime.datetime.utcnow().isoformat()
     data = {
         "event": event_type,
@@ -125,8 +125,9 @@ async def log_event(event_type, user_id, extra=""):
     def _insert():
         return supabase.table("logs").insert(data).execute()
     res = await asyncio.to_thread(_insert)
-    if res.error:
-        print(f"Supabase log error: {res.error.message}")
+    if res.status_code >= 400:
+        print(f"Supabase log error: {res.data}")
+
 
 # --- HJELPEFUNKSJONER ---
 
